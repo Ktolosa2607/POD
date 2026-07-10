@@ -3,4 +3,3 @@ pymysql
 pandas
 qrcode
 fpdf
-streamlit-drawable-canvas
