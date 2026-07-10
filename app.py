@@ -8,7 +8,9 @@ from io import BytesIO
 from fpdf import FPDF
 import os
 
-# Configuración de página
+# ==========================================
+# CONFIGURACIÓN INICIAL
+# ==========================================
 st.set_page_config(page_title="Sistema de Recepción - POD", layout="wide")
 
 # --- CONEXIÓN A TiDB ---
@@ -115,24 +117,34 @@ if menu == "Nueva Recepción (POD)":
             deliverer_sig = st.text_input("Firma de quien entrega (Iniciales)")
 
         if st.button("✅ Generar y Guardar POD"):
-            with conn.cursor() as cursor:
-                sql_pod = "INSERT INTO pods (provider_name, total_pallets, receiver_name, deliverer_name, receiver_signature, deliverer_signature) VALUES (%s, %s, %s, %s, %s, %s)"
-                cursor.execute(sql_pod, (st.session_state.pod_data['provider'], st.session_state.pod_data['total_pallets'], receiver_name, deliverer_name, receiver_sig, deliverer_sig))
-                pod_id = cursor.lastrowid
+            try:
+                # Reconectar en caso de que la conexión a TiDB se haya puesto en reposo
+                conn.ping(reconnect=True) 
                 
-                for p in st.session_state.pod_data['pallets']:
-                    sql_pallet = "INSERT INTO pallets (pod_id, pallet_number, box_count, has_damage) VALUES (%s, %s, %s, %s)"
-                    cursor.execute(sql_pallet, (pod_id, p['pallet_number'], p['box_count'], p['has_damage']))
-                    pallet_id = cursor.lastrowid
+                with conn.cursor() as cursor:
+                    # 1. Insertar POD
+                    sql_pod = "INSERT INTO pods (provider_name, total_pallets, receiver_name, deliverer_name, receiver_signature, deliverer_signature) VALUES (%s, %s, %s, %s, %s, %s)"
+                    cursor.execute(sql_pod, (st.session_state.pod_data['provider'], st.session_state.pod_data['total_pallets'], receiver_name, deliverer_name, receiver_sig, deliverer_sig))
+                    pod_id = cursor.lastrowid
                     
-                    for photo_b64 in p['photos']:
-                        sql_photo = "INSERT INTO damaged_photos (pallet_id, image_data) VALUES (%s, %s)"
-                        cursor.execute(sql_photo, (pallet_id, photo_b64))
-            
-            st.success(f"¡POD #{pod_id} generada y guardada exitosamente en TiDB!")
-            st.session_state.step = 1
-            st.session_state.pod_data = {'pallets': []}
-            st.session_state.current_pallet = 1
+                    # 2. Insertar Pallets
+                    for p in st.session_state.pod_data['pallets']:
+                        sql_pallet = "INSERT INTO pallets (pod_id, pallet_number, box_count, has_damage) VALUES (%s, %s, %s, %s)"
+                        cursor.execute(sql_pallet, (pod_id, p['pallet_number'], p['box_count'], p['has_damage']))
+                        pallet_id = cursor.lastrowid
+                        
+                        # 3. Insertar Fotos
+                        for photo_b64 in p['photos']:
+                            sql_photo = "INSERT INTO damaged_photos (pallet_id, image_data) VALUES (%s, %s)"
+                            cursor.execute(sql_photo, (pallet_id, photo_b64))
+                
+                st.success(f"¡POD #{pod_id} generada y guardada exitosamente en TiDB!")
+                st.session_state.step = 1
+                st.session_state.pod_data = {'pallets': []}
+                st.session_state.current_pallet = 1
+                
+            except Exception as e:
+                st.error(f"🚨 Error al guardar: {e}")
 
 # ==========================================
 # PANTALLA 2: HISTORIAL
@@ -147,21 +159,25 @@ elif menu == "Historial de PODs":
         target_pod = query_params["pod_id"]
         st.subheader(f"📸 Visor de Evidencias - POD #{target_pod}")
         
-        sql_fotos = """
-            SELECT p.pallet_number, dp.image_data 
-            FROM pallets p 
-            JOIN damaged_photos dp ON p.id = dp.pallet_id 
-            WHERE p.pod_id = %s
-        """
-        df_fotos = pd.read_sql(sql_fotos, conn, params=(target_pod,))
-        
-        if len(df_fotos) > 0:
-            for index, row in df_fotos.iterrows():
-                st.write(f"**Pallet #{row['pallet_number']}**")
-                img_bytes = base64.b64decode(row['image_data'])
-                st.image(img_bytes, width=400)
-        else:
-            st.success("Este POD no tiene reportes de cajas dañadas.")
+        try:
+            conn.ping(reconnect=True)
+            sql_fotos = """
+                SELECT p.pallet_number, dp.image_data 
+                FROM pallets p 
+                JOIN damaged_photos dp ON p.id = dp.pallet_id 
+                WHERE p.pod_id = %s
+            """
+            df_fotos = pd.read_sql(sql_fotos, conn, params=(target_pod,))
+            
+            if len(df_fotos) > 0:
+                for index, row in df_fotos.iterrows():
+                    st.write(f"**Pallet #{row['pallet_number']}**")
+                    img_bytes = base64.b64decode(row['image_data'])
+                    st.image(img_bytes, width=400)
+            else:
+                st.success("Este POD no tiene reportes de cajas dañadas.")
+        except Exception as e:
+            st.error(f"Error al cargar las fotos: {e}")
             
         if st.button("Volver al Historial General"):
             st.query_params.clear()
@@ -169,81 +185,85 @@ elif menu == "Historial de PODs":
             
     # 2. MODO TABLA GENERAL Y DESCARGA DE PDF
     else:
-        df_pods = pd.read_sql("SELECT id as POD_ID, provider_name as Proveedor, total_pallets as Pallets, created_at as Fecha FROM pods ORDER BY id DESC", conn)
-        st.dataframe(df_pods, use_container_width=True)
-        
-        selected_pod = st.selectbox("Seleccione un POD para ver detalles o imprimir", df_pods['POD_ID'])
-        if selected_pod:
+        try:
+            conn.ping(reconnect=True)
+            df_pods = pd.read_sql("SELECT id as POD_ID, provider_name as Proveedor, total_pallets as Pallets, created_at as Fecha FROM pods ORDER BY id DESC", conn)
+            st.dataframe(df_pods, use_container_width=True)
             
-            # --- CONFIGURAR URL DEL QR ---
-            MI_URL_STREAMLIT = "https://kphwfbxyb78gwczjjetjsf.streamlit.app"
-            url_qr = f"{MI_URL_STREAMLIT}/?pod_id={selected_pod}"
-            
-            col_info, col_qr = st.columns([2, 1])
-            with col_qr:
-                qr = qrcode.make(url_qr)
-                qr_img_path = f"qr_temp_{selected_pod}.png"
-                qr.save(qr_img_path)
-                st.image(qr.get_image(), caption=f"QR de Evidencias", width=150)
-            
-            with col_info:
-                st.markdown(f"**Leyenda Legal:** *Se reciben cajas cerradas no se han contado la cantidad de paquetes que se están recibiendo, por lo que luego de la revisión se contarán las piezas.*")
+            selected_pod = st.selectbox("Seleccione un POD para ver detalles o imprimir", df_pods['POD_ID'])
+            if selected_pod:
                 
-                # --- GENERAR PDF ---
-                pod_info = pd.read_sql("SELECT * FROM pods WHERE id = %s", conn, params=(selected_pod,)).iloc[0]
-                pallets_info = pd.read_sql("SELECT pallet_number, box_count, has_damage FROM pallets WHERE pod_id = %s", conn, params=(selected_pod,))
+                # --- URL REAL DE LA APLICACIÓN ---
+                MI_URL_STREAMLIT = "https://kphwfbxyb78gwczjjetjsf.streamlit.app"
+                url_qr = f"{MI_URL_STREAMLIT}/?pod_id={selected_pod}"
                 
-                pdf = FPDF()
-                pdf.add_page()
+                col_info, col_qr = st.columns([2, 1])
+                with col_qr:
+                    qr = qrcode.make(url_qr)
+                    qr_img_path = f"qr_temp_{selected_pod}.png"
+                    qr.save(qr_img_path)
+                    st.image(qr.get_image(), caption=f"QR de Evidencias", width=150)
                 
-                # Titulo
-                pdf.set_font("Arial", 'B', 16)
-                pdf.cell(0, 10, f"PROOF OF DELIVERY (POD) #{selected_pod}", ln=True, align='C')
-                pdf.set_font("Arial", '', 11)
-                pdf.cell(0, 10, f"Fecha: {pod_info['created_at']}   |   Proveedor: {pod_info['provider_name']}   |   Pallets: {pod_info['total_pallets']}", ln=True, align='C')
-                pdf.ln(10)
-                
-                # Tabla
-                pdf.set_font("Arial", 'B', 10)
-                pdf.cell(40, 10, "Pallet #", border=1, align='C')
-                pdf.cell(40, 10, "Cajas", border=1, align='C')
-                pdf.cell(40, 10, "Danos?", border=1, align='C')
-                pdf.ln()
-                
-                pdf.set_font("Arial", '', 10)
-                for _, row in pallets_info.iterrows():
-                    pdf.cell(40, 10, str(row['pallet_number']), border=1, align='C')
-                    pdf.cell(40, 10, str(row['box_count']), border=1, align='C')
-                    pdf.cell(40, 10, "Si" if row['has_damage'] else "No", border=1, align='C')
+                with col_info:
+                    st.markdown(f"**Leyenda Legal:** *Se reciben cajas cerradas no se han contado la cantidad de paquetes que se están recibiendo, por lo que luego de la revisión se contarán las piezas.*")
+                    
+                    # --- GENERAR PDF ---
+                    pod_info = pd.read_sql("SELECT * FROM pods WHERE id = %s", conn, params=(selected_pod,)).iloc[0]
+                    pallets_info = pd.read_sql("SELECT pallet_number, box_count, has_damage FROM pallets WHERE pod_id = %s", conn, params=(selected_pod,))
+                    
+                    pdf = FPDF()
+                    pdf.add_page()
+                    
+                    # Titulo
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.cell(0, 10, f"PROOF OF DELIVERY (POD) #{selected_pod}", ln=True, align='C')
+                    pdf.set_font("Arial", '', 11)
+                    pdf.cell(0, 10, f"Fecha: {pod_info['created_at']}   |   Proveedor: {pod_info['provider_name']}   |   Pallets: {pod_info['total_pallets']}", ln=True, align='C')
+                    pdf.ln(10)
+                    
+                    # Tabla
+                    pdf.set_font("Arial", 'B', 10)
+                    pdf.cell(40, 10, "Pallet #", border=1, align='C')
+                    pdf.cell(40, 10, "Cajas", border=1, align='C')
+                    pdf.cell(40, 10, "Danos?", border=1, align='C')
                     pdf.ln()
-                
-                pdf.ln(10)
-                
-                # Leyenda
-                pdf.set_font("Arial", 'I', 9)
-                leyenda = "Leyenda Legal: Se reciben cajas cerradas no se han contado la cantidad de paquetes que se estan recibiendo, por lo que luego de la revision se contaran las piezas correspondientes."
-                pdf.multi_cell(0, 5, leyenda)
-                pdf.ln(20)
-                
-                # Firmas
-                pdf.set_font("Arial", 'B', 10)
-                pdf.cell(90, 10, "_________________________", align='C')
-                pdf.cell(90, 10, "_________________________", align='C')
-                pdf.ln()
-                pdf.cell(90, 5, "Firma Quien Entrega", align='C')
-                pdf.cell(90, 5, "Firma Quien Recibe", align='C')
-                pdf.ln(20)
-                
-                # QR
-                pdf.image(qr_img_path, x=85, w=40)
-                pdf.cell(0, 10, "Escanee para ver fotos de evidencias", ln=True, align='C')
-                
-                # Descargar
-                pdf_bytes = pdf.output(dest='S').encode('latin1')
-                
-                st.download_button(
-                    label="⬇️ Descargar POD en PDF",
-                    data=pdf_bytes,
-                    file_name=f"POD_Recepcion_{selected_pod}.pdf",
-                    mime="application/pdf"
-                )
+                    
+                    pdf.set_font("Arial", '', 10)
+                    for _, row in pallets_info.iterrows():
+                        pdf.cell(40, 10, str(row['pallet_number']), border=1, align='C')
+                        pdf.cell(40, 10, str(row['box_count']), border=1, align='C')
+                        pdf.cell(40, 10, "Si" if row['has_damage'] else "No", border=1, align='C')
+                        pdf.ln()
+                    
+                    pdf.ln(10)
+                    
+                    # Leyenda
+                    pdf.set_font("Arial", 'I', 9)
+                    leyenda = "Leyenda Legal: Se reciben cajas cerradas no se han contado la cantidad de paquetes que se estan recibiendo, por lo que luego de la revision se contaran las piezas correspondientes."
+                    pdf.multi_cell(0, 5, leyenda)
+                    pdf.ln(20)
+                    
+                    # Firmas
+                    pdf.set_font("Arial", 'B', 10)
+                    pdf.cell(90, 10, "_________________________", align='C')
+                    pdf.cell(90, 10, "_________________________", align='C')
+                    pdf.ln()
+                    pdf.cell(90, 5, "Firma Quien Entrega", align='C')
+                    pdf.cell(90, 5, "Firma Quien Recibe", align='C')
+                    pdf.ln(20)
+                    
+                    # QR
+                    pdf.image(qr_img_path, x=85, w=40)
+                    pdf.cell(0, 10, "Escanee para ver fotos de evidencias", ln=True, align='C')
+                    
+                    # Descargar
+                    pdf_bytes = pdf.output(dest='S').encode('latin1')
+                    
+                    st.download_button(
+                        label="⬇️ Descargar POD en PDF",
+                        data=pdf_bytes,
+                        file_name=f"POD_Recepcion_{selected_pod}.pdf",
+                        mime="application/pdf"
+                    )
+        except Exception as e:
+            st.error(f"🚨 Error al cargar el historial: {e}")
