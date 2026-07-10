@@ -5,6 +5,8 @@ from datetime import datetime
 import base64
 import qrcode
 from io import BytesIO
+from fpdf import FPDF
+import os
 
 # Configuración de página
 st.set_page_config(page_title="Sistema de Recepción - POD", layout="wide")
@@ -77,13 +79,11 @@ if menu == "Nueva Recepción (POD)":
             st.warning("📸 Por favor, tome fotos de las cajas dañadas antes de cerrar el pallet.")
             uploaded_files = st.file_uploader("Adjuntar fotos", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
             for file in uploaded_files:
-                # Convertir imagen a Base64
                 bytes_data = file.getvalue()
                 base64_img = base64.b64encode(bytes_data).decode('utf-8')
                 photos.append(base64_img)
 
         if st.button("Guardar Pallet y Continuar 📦"):
-            # Guardar datos del pallet en sesión
             st.session_state.pod_data['pallets'].append({
                 'pallet_number': current,
                 'box_count': box_count,
@@ -108,21 +108,18 @@ if menu == "Nueva Recepción (POD)":
         
         col1, col2 = st.columns(2)
         with col1:
-            receiver_name = st.text_input("Nombre de quien recibe (Tú)")
-            # Nota: Para firmas reales puedes usar 'streamlit-drawable-canvas'
-            receiver_sig = st.text_input("Firma de quien recibe (Escribir iniciales por ahora)") 
+            receiver_name = st.text_input("Nombre de quien recibe (Bodega)")
+            receiver_sig = st.text_input("Firma de quien recibe (Iniciales)") 
         with col2:
             deliverer_name = st.text_input("Nombre de quien entrega (Proveedor)")
-            deliverer_sig = st.text_input("Firma de quien entrega")
+            deliverer_sig = st.text_input("Firma de quien entrega (Iniciales)")
 
         if st.button("✅ Generar y Guardar POD"):
-            # 1. Insertar en TiDB (Tabla pods)
             with conn.cursor() as cursor:
                 sql_pod = "INSERT INTO pods (provider_name, total_pallets, receiver_name, deliverer_name, receiver_signature, deliverer_signature) VALUES (%s, %s, %s, %s, %s, %s)"
                 cursor.execute(sql_pod, (st.session_state.pod_data['provider'], st.session_state.pod_data['total_pallets'], receiver_name, deliverer_name, receiver_sig, deliverer_sig))
                 pod_id = cursor.lastrowid
                 
-                # 2. Insertar Pallets y Fotos
                 for p in st.session_state.pod_data['pallets']:
                     sql_pallet = "INSERT INTO pallets (pod_id, pallet_number, box_count, has_damage) VALUES (%s, %s, %s, %s)"
                     cursor.execute(sql_pallet, (pod_id, p['pallet_number'], p['box_count'], p['has_damage']))
@@ -133,7 +130,7 @@ if menu == "Nueva Recepción (POD)":
                         cursor.execute(sql_photo, (pallet_id, photo_b64))
             
             st.success(f"¡POD #{pod_id} generada y guardada exitosamente en TiDB!")
-            st.session_state.step = 1 # Reiniciar wizard
+            st.session_state.step = 1
             st.session_state.pod_data = {'pallets': []}
             st.session_state.current_pallet = 1
 
@@ -143,32 +140,110 @@ if menu == "Nueva Recepción (POD)":
 elif menu == "Historial de PODs":
     st.title("📜 Historial de Recepciones")
     
-    # Obtener params de URL para el código QR
     query_params = st.query_params
     
-    # Si viene de un escaneo de QR (URL termina en ?pod_id=X)
+    # 1. MODO VISOR DE FOTOS (Cuando se escanea el QR)
     if "pod_id" in query_params:
         target_pod = query_params["pod_id"]
-        st.subheader(f"Visor de Evidencias - POD #{target_pod}")
-        # Aquí harías un SELECT a TiDB uniendo las fotos del pod_id
-        st.info("Aquí se muestran las fotos extraídas de la base de datos para este POD.")
+        st.subheader(f"📸 Visor de Evidencias - POD #{target_pod}")
+        
+        sql_fotos = """
+            SELECT p.pallet_number, dp.image_data 
+            FROM pallets p 
+            JOIN damaged_photos dp ON p.id = dp.pallet_id 
+            WHERE p.pod_id = %s
+        """
+        df_fotos = pd.read_sql(sql_fotos, conn, params=(target_pod,))
+        
+        if len(df_fotos) > 0:
+            for index, row in df_fotos.iterrows():
+                st.write(f"**Pallet #{row['pallet_number']}**")
+                img_bytes = base64.b64decode(row['image_data'])
+                st.image(img_bytes, width=400)
+        else:
+            st.success("Este POD no tiene reportes de cajas dañadas.")
+            
         if st.button("Volver al Historial General"):
             st.query_params.clear()
             st.rerun()
             
+    # 2. MODO TABLA GENERAL Y DESCARGA DE PDF
     else:
-        # Mostrar tabla general
         df_pods = pd.read_sql("SELECT id as POD_ID, provider_name as Proveedor, total_pallets as Pallets, created_at as Fecha FROM pods ORDER BY id DESC", conn)
-        st.dataframe(df_pods)
+        st.dataframe(df_pods, use_container_width=True)
         
-        # Seleccionar uno para ver detalles / Imprimir PDF
         selected_pod = st.selectbox("Seleccione un POD para ver detalles o imprimir", df_pods['POD_ID'])
         if selected_pod:
-            # Aquí podrías usar la librería FPDF para generar un archivo .pdf descargable
-            st.markdown(f"**Leyenda Legal:** *Se reciben cajas cerradas no se han contado la cantidad de paquetes que se están recibiendo, por lo que luego de la revisión se contarán las piezas.*")
             
-            # Generar QR dinámico
-            url_qr = f"https://tu-app-en-streamlit.app/?pod_id={selected_pod}"
-            qr = qrcode.make(url_qr)
-            # Mostrar QR en pantalla
-            st.image(qr.get_image(), caption=f"QR de Evidencias POD #{selected_pod}", width=150)
+            # --- CONFIGURAR URL DEL QR ---
+            MI_URL_STREAMLIT = "https://tu-url-aqui.streamlit.app" # <--- CAMBIAR POR TU URL REAL
+            url_qr = f"{MI_URL_STREAMLIT}/?pod_id={selected_pod}"
+            
+            col_info, col_qr = st.columns([2, 1])
+            with col_qr:
+                qr = qrcode.make(url_qr)
+                qr_img_path = f"qr_temp_{selected_pod}.png"
+                qr.save(qr_img_path)
+                st.image(qr.get_image(), caption=f"QR de Evidencias", width=150)
+            
+            with col_info:
+                st.markdown(f"**Leyenda Legal:** *Se reciben cajas cerradas no se han contado la cantidad de paquetes que se están recibiendo, por lo que luego de la revisión se contarán las piezas.*")
+                
+                # --- GENERAR PDF ---
+                pod_info = pd.read_sql("SELECT * FROM pods WHERE id = %s", conn, params=(selected_pod,)).iloc[0]
+                pallets_info = pd.read_sql("SELECT pallet_number, box_count, has_damage FROM pallets WHERE pod_id = %s", conn, params=(selected_pod,))
+                
+                pdf = FPDF()
+                pdf.add_page()
+                
+                # Titulo
+                pdf.set_font("Arial", 'B', 16)
+                pdf.cell(0, 10, f"PROOF OF DELIVERY (POD) #{selected_pod}", ln=True, align='C')
+                pdf.set_font("Arial", '', 11)
+                pdf.cell(0, 10, f"Fecha: {pod_info['created_at']}   |   Proveedor: {pod_info['provider_name']}   |   Pallets: {pod_info['total_pallets']}", ln=True, align='C')
+                pdf.ln(10)
+                
+                # Tabla
+                pdf.set_font("Arial", 'B', 10)
+                pdf.cell(40, 10, "Pallet #", border=1, align='C')
+                pdf.cell(40, 10, "Cajas", border=1, align='C')
+                pdf.cell(40, 10, "Danos?", border=1, align='C')
+                pdf.ln()
+                
+                pdf.set_font("Arial", '', 10)
+                for _, row in pallets_info.iterrows():
+                    pdf.cell(40, 10, str(row['pallet_number']), border=1, align='C')
+                    pdf.cell(40, 10, str(row['box_count']), border=1, align='C')
+                    pdf.cell(40, 10, "Si" if row['has_damage'] else "No", border=1, align='C')
+                    pdf.ln()
+                
+                pdf.ln(10)
+                
+                # Leyenda
+                pdf.set_font("Arial", 'I', 9)
+                leyenda = "Leyenda Legal: Se reciben cajas cerradas no se han contado la cantidad de paquetes que se estan recibiendo, por lo que luego de la revision se contaran las piezas correspondientes."
+                pdf.multi_cell(0, 5, leyenda)
+                pdf.ln(20)
+                
+                # Firmas
+                pdf.set_font("Arial", 'B', 10)
+                pdf.cell(90, 10, "_________________________", align='C')
+                pdf.cell(90, 10, "_________________________", align='C')
+                pdf.ln()
+                pdf.cell(90, 5, "Firma Quien Entrega", align='C')
+                pdf.cell(90, 5, "Firma Quien Recibe", align='C')
+                pdf.ln(20)
+                
+                # QR
+                pdf.image(qr_img_path, x=85, w=40)
+                pdf.cell(0, 10, "Escanee para ver fotos de evidencias", ln=True, align='C')
+                
+                # Descargar
+                pdf_bytes = pdf.output(dest='S').encode('latin1')
+                
+                st.download_button(
+                    label="⬇️ Descargar POD en PDF",
+                    data=pdf_bytes,
+                    file_name=f"POD_Recepcion_{selected_pod}.pdf",
+                    mime="application/pdf"
+                )
