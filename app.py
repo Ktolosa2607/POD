@@ -176,7 +176,7 @@ elif menu == "Historial de PODs":
         if selected_pod:
             
             # --- CONFIGURAR URL DEL QR ---
-            MI_URL_STREAMLIT = "https://tu-url-aqui.streamlit.app" # <--- CAMBIAR POR TU URL REAL
+            MI_URL_STREAMLIT = "https://kphwfbxyb78gwczjjetjsf.streamlit.app"" # <--- CAMBIAR POR TU URL REAL
             url_qr = f"{MI_URL_STREAMLIT}/?pod_id={selected_pod}"
             
             col_info, col_qr = st.columns([2, 1])
